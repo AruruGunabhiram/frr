@@ -45,6 +45,22 @@
 DECLARE_DLIST(bgp_evpn_es_vrf_frag, struct bgp_evpn_es_vrf, es_frag_item);
 DECLARE_DLIST(bgp_evpn_es_vrf_vtep_list, struct bgp_evpn_es_vrf_vtep, es_vrf_item);
 DECLARE_DLIST(bgp_evpn_es_l3_vtep_list, struct bgp_evpn_es_l3_vtep, es_item);
+DECLARE_DLIST(bgp_evpn_es_l3evi_list, struct bgp_evpn_es_l3evi, list_item);
+
+PREDECL_LIST(bgp_evpn_ip_ead_path_owner_list);
+
+struct bgp_evpn_ip_ead_path_owner {
+	struct bgp *bgp_vrf;
+	struct bgp_evpn_es_vrf_vtep *vtep;
+	bool per_evi;
+	struct bgp_evpn_ip_ead_path_owner_list_item item;
+};
+
+DECLARE_LIST(bgp_evpn_ip_ead_path_owner_list, struct bgp_evpn_ip_ead_path_owner, item);
+
+struct bgp_evpn_ip_ead_path_owners {
+	struct bgp_evpn_ip_ead_path_owner_list_head list;
+};
 
 static void bgp_evpn_mh_get_vtep_ip(const struct attr *attr, struct ipaddr *vtep_ip)
 {
@@ -135,6 +151,7 @@ static void bgp_evpn_run_consistency_checks(struct event *t);
 static void bgp_evpn_path_nh_info_free(struct bgp_path_evpn_nh_info *nh_info);
 static void bgp_evpn_path_nh_unlink(struct bgp_path_evpn_nh_info *nh_info);
 static void bgp_evpn_es_vrf_delete(struct bgp_evpn_es_vrf *es_vrf);
+static void bgp_evpn_ip_ead_flush_vrf(struct bgp *bgp_vrf);
 static void bgp_evpn_local_es_l3evi_del_all(struct bgp_evpn_es *es);
 static void bgp_evpn_local_es_l3evi_bind_all(struct bgp_evpn_es *es);
 static struct bgp_evpn_es_evi *bgp_evpn_es_evi_free_internal(struct bgp_evpn_es_evi *es_evi,
@@ -3499,6 +3516,7 @@ void bgp_evpn_vrf_es_cleanup(struct bgp *bgp_vrf)
 	if (!bgp_vrf || !bgp_mh_info)
 		return;
 
+	bgp_evpn_ip_ead_flush_vrf(bgp_vrf);
 	RB_FOREACH_SAFE (es_vrf, bgp_es_vrf_rb_head, &bgp_vrf->es_vrf_rb_tree, es_vrf_next)
 		bgp_evpn_es_vrf_delete(es_vrf);
 }
@@ -3581,7 +3599,6 @@ static void bgp_evpn_es_vrf_delete(struct bgp_evpn_es_vrf *es_vrf)
 	struct bgp_evpn_es *es = es_vrf->es;
 	struct bgp *bgp_vrf = es_vrf->bgp_vrf;
 	struct bgp_evpn_es_l3evi *l3evi;
-	struct listnode *node;
 
 	if (BGP_DEBUG(evpn_mh, EVPN_MH_ES))
 		zlog_debug("es %s vrf %u nhg %u delete", es->esi_str,
@@ -3589,7 +3606,7 @@ static void bgp_evpn_es_vrf_delete(struct bgp_evpn_es_vrf *es_vrf)
 
 	/* L3VNI ES-EVIs still referencing this ES-VRF go back to pending */
 	if (es_vrf->l3_ref_cnt)
-		for (ALL_LIST_ELEMENTS_RO(bgp_mh_info->l3evi_list, node, l3evi))
+		frr_each (bgp_evpn_es_l3evi_list, &bgp_mh_info->l3evi_list, l3evi)
 			if (l3evi->es_vrf == es_vrf)
 				l3evi->es_vrf = NULL;
 
@@ -4156,14 +4173,6 @@ void bgp_evpn_mh_bpp_replay(void)
 							&l3_vtep->sent_rmac, true);
 }
 
-static void bgp_evpn_es_vrf_vtep_flush(struct bgp_evpn_es_vrf *es_vrf)
-{
-	struct bgp_evpn_es_vrf_vtep *vtep;
-
-	while ((vtep = bgp_evpn_es_vrf_vtep_list_pop(&es_vrf->es_vrf_vtep_list)))
-		XFREE(MTYPE_BGP_EVPN_ES_VRF_VTEP, vtep);
-}
-
 static void bgp_evpn_ip_ead_evi_ref(struct bgp_evpn_es_vrf_vtep *vtep, const struct ethaddr *rmac)
 {
 	if (vtep->evi_ref++ == 0)
@@ -4198,6 +4207,71 @@ static void bgp_evpn_ip_ead_es_deref(struct bgp_evpn_es_vrf_vtep *vtep)
 		UNSET_FLAG(vtep->flags, BGP_EVPN_ES_VRF_VTEP_IP_EAD_ES);
 }
 
+static struct bgp_evpn_ip_ead_path_owners *bgp_evpn_ip_ead_path_owners_get(struct bgp_path_info *pi)
+{
+	struct bgp_path_info_extra *extra;
+	struct bgp_evpn_ip_ead_path_owners *owners;
+
+	extra = bgp_evpn_path_info_extra_get(pi);
+	owners = extra->evpn->ip_ead_owners;
+	if (owners)
+		return owners;
+
+	owners = XCALLOC(MTYPE_BGP_EVPN_IP_EAD_PATH_OWNER, sizeof(*owners));
+	bgp_evpn_ip_ead_path_owner_list_init(&owners->list);
+	extra->evpn->ip_ead_owners = owners;
+	return owners;
+}
+
+static struct bgp_evpn_ip_ead_path_owner *bgp_evpn_ip_ead_path_owner_find(struct bgp_path_info *pi,
+									  const struct bgp *bgp_vrf)
+{
+	struct bgp_evpn_ip_ead_path_owners *owners;
+	struct bgp_evpn_ip_ead_path_owner *owner;
+
+	if (!pi->extra || !pi->extra->evpn)
+		return NULL;
+	owners = pi->extra->evpn->ip_ead_owners;
+	if (!owners)
+		return NULL;
+
+	frr_each (bgp_evpn_ip_ead_path_owner_list, &owners->list, owner)
+		if (owner->bgp_vrf == bgp_vrf)
+			return owner;
+	return NULL;
+}
+
+static void bgp_evpn_ip_ead_path_owner_del(struct bgp_evpn_ip_ead_path_owners *owners,
+					   struct bgp_evpn_ip_ead_path_owner *owner)
+{
+	struct bgp_evpn_es_vrf_vtep *vtep = owner->vtep;
+	struct bgp_evpn_es *es = vtep->es_vrf->es;
+	struct ipaddr vtep_ip = vtep->vtep_ip;
+
+	if (owner->per_evi)
+		bgp_evpn_ip_ead_evi_deref(vtep);
+	else
+		bgp_evpn_ip_ead_es_deref(vtep);
+	bgp_evpn_es_l3_vtep_re_eval(es, &vtep_ip);
+	bgp_evpn_ip_ead_path_owner_list_del(&owners->list, owner);
+	XFREE(MTYPE_BGP_EVPN_IP_EAD_PATH_OWNER, owner);
+	bgp_evpn_es_vrf_vtep_try_free(vtep);
+}
+
+void bgp_evpn_ip_ead_path_owners_free(struct bgp_evpn_ip_ead_path_owners **ownersp)
+{
+	struct bgp_evpn_ip_ead_path_owners *owners;
+
+	if (!ownersp || !*ownersp)
+		return;
+
+	owners = *ownersp;
+	assert(!bgp_evpn_ip_ead_path_owner_list_count(&owners->list));
+	bgp_evpn_ip_ead_path_owner_list_fini(&owners->list);
+	XFREE(MTYPE_BGP_EVPN_IP_EAD_PATH_OWNER, owners);
+	*ownersp = NULL;
+}
+
 /* True if this VTEP is ours: the EVPN instance originator, or a local ES. */
 static bool bgp_evpn_ip_ead_vtep_is_local(struct bgp *bgp_evpn, const struct ipaddr *vtep)
 {
@@ -4225,6 +4299,8 @@ void bgp_evpn_ip_ead_process(struct bgp *bgp_vrf, struct prefix_evpn *evp,
 	struct bgp_evpn_es *es;
 	struct bgp_evpn_es_vrf *es_vrf;
 	struct bgp_evpn_es_vrf_vtep *vtep;
+	struct bgp_evpn_ip_ead_path_owners *owners;
+	struct bgp_evpn_ip_ead_path_owner *owner;
 	struct ipaddr vtep_ip = {};
 	uint32_t eth_tag;
 	vni_t route_vni;
@@ -4243,37 +4319,29 @@ void bgp_evpn_ip_ead_process(struct bgp *bgp_vrf, struct prefix_evpn *evp,
 	bgp_evpn = bgp_get_evpn();
 	if (!bgp_evpn)
 		return;
-	if (import && !bgp_evpn->advertise_l3vni_neigh)
+
+	owner = bgp_evpn_ip_ead_path_owner_find(pi, bgp_vrf);
+	if (!import) {
+		if (!owner)
+			return;
+		owners = pi->extra->evpn->ip_ead_owners;
+		bgp_evpn_ip_ead_path_owner_del(owners, owner);
+		return;
+	}
+
+	if (!bgp_evpn->advertise_l3vni_neigh)
 		return;
 
 	bgp_evpn_mh_fill_vtep_ip_from_pi(pi, &vtep_ip);
 	if (bgp_evpn_ip_ead_vtep_is_local(bgp_evpn, &vtep_ip))
-		return;
+		goto reject;
 
 	eth_tag = evp->prefix.ead_addr.eth_tag;
 	per_evi = (eth_tag == BGP_EVPN_AD_EVI_ETH_TAG);
 	if (!per_evi && eth_tag != BGP_EVPN_AD_ES_ETH_TAG)
-		return;
+		goto reject;
 
 	es = bgp_evpn_es_find(&evp->prefix.ead_addr.esi);
-	if (!import) {
-		if (!es)
-			return;
-		es_vrf = bgp_evpn_es_vrf_find(es, bgp_vrf);
-		if (!es_vrf)
-			return;
-		vtep = bgp_evpn_es_vrf_vtep_find(es_vrf, &vtep_ip);
-		if (!vtep)
-			return;
-		if (per_evi)
-			bgp_evpn_ip_ead_evi_deref(vtep);
-		else
-			bgp_evpn_ip_ead_es_deref(vtep);
-		bgp_evpn_es_l3_vtep_re_eval(es, &vtep_ip);
-		bgp_evpn_es_vrf_vtep_try_free(vtep);
-		return;
-	}
-
 	if (!es)
 		es = bgp_evpn_es_new(bgp_evpn, &evp->prefix.ead_addr.esi);
 
@@ -4291,7 +4359,7 @@ void bgp_evpn_ip_ead_process(struct bgp *bgp_vrf, struct prefix_evpn *evp,
 					   bgp_vrf->name_pretty, &vtep_ip, route_vni,
 					   bgp_vrf->l3vni);
 			bgp_evpn_es_vrf_try_delete(es_vrf);
-			return;
+			goto reject;
 		}
 		if (is_zero_mac(&pi->attr->rmac)) {
 			es_vrf->ip_ead_drop_rmac++;
@@ -4300,8 +4368,17 @@ void bgp_evpn_ip_ead_process(struct bgp *bgp_vrf, struct prefix_evpn *evp,
 					   esi_to_str(&evp->prefix.ead_addr.esi, buf, sizeof(buf)),
 					   bgp_vrf->name_pretty, &vtep_ip);
 			bgp_evpn_es_vrf_try_delete(es_vrf);
-			return;
+			goto reject;
 		}
+	}
+
+	if (owner && owner->per_evi == per_evi && !ipaddr_cmp(&owner->vtep->vtep_ip, &vtep_ip)) {
+		if (per_evi) {
+			memcpy(&owner->vtep->rmac, &pi->attr->rmac, ETH_ALEN);
+			bgp_evpn_es_l3_vtep_rmac_update(es, &vtep_ip, &pi->attr->rmac);
+		}
+		bgp_evpn_es_l3_vtep_re_eval(es, &vtep_ip);
+		return;
 	}
 
 	vtep = bgp_evpn_es_vrf_vtep_get(es_vrf, &vtep_ip);
@@ -4309,6 +4386,27 @@ void bgp_evpn_ip_ead_process(struct bgp *bgp_vrf, struct prefix_evpn *evp,
 		bgp_evpn_ip_ead_evi_ref(vtep, &pi->attr->rmac);
 	else
 		bgp_evpn_ip_ead_es_ref(vtep);
+	if (owner) {
+		struct bgp_evpn_es_vrf_vtep *old_vtep = owner->vtep;
+		struct bgp_evpn_es *old_es = old_vtep->es_vrf->es;
+		struct ipaddr old_vtep_ip = old_vtep->vtep_ip;
+
+		if (owner->per_evi)
+			bgp_evpn_ip_ead_evi_deref(old_vtep);
+		else
+			bgp_evpn_ip_ead_es_deref(old_vtep);
+		owner->vtep = vtep;
+		owner->per_evi = per_evi;
+		bgp_evpn_es_l3_vtep_re_eval(old_es, &old_vtep_ip);
+		bgp_evpn_es_vrf_vtep_try_free(old_vtep);
+	} else {
+		owners = bgp_evpn_ip_ead_path_owners_get(pi);
+		owner = XCALLOC(MTYPE_BGP_EVPN_IP_EAD_PATH_OWNER, sizeof(*owner));
+		owner->bgp_vrf = bgp_vrf;
+		owner->vtep = vtep;
+		owner->per_evi = per_evi;
+		bgp_evpn_ip_ead_path_owner_list_add_tail(&owners->list, owner);
+	}
 
 	if (BGP_DEBUG(evpn_mh, EVPN_MH_PROT))
 		zlog_debug("es %s vrf %s vtep %pIA ip-ead-%s add evi_ref %u es_ref %u", es->esi_str,
@@ -4316,6 +4414,13 @@ void bgp_evpn_ip_ead_process(struct bgp *bgp_vrf, struct prefix_evpn *evp,
 			   vtep->es_ref);
 
 	bgp_evpn_es_l3_vtep_re_eval(es, &vtep_ip);
+	return;
+
+reject:
+	if (owner) {
+		owners = pi->extra->evpn->ip_ead_owners;
+		bgp_evpn_ip_ead_path_owner_del(owners, owner);
+	}
 }
 
 void bgp_evpn_ip_ead_install_uninstall(struct prefix_evpn *evp, struct bgp_path_info *pi,
@@ -4366,6 +4471,43 @@ void bgp_evpn_ip_ead_reimport(void)
 	}
 }
 
+static void bgp_evpn_ip_ead_path_owners_drain(struct bgp_path_info *pi, struct bgp *bgp_vrf)
+{
+	struct bgp_evpn_ip_ead_path_owners *owners;
+	struct bgp_evpn_ip_ead_path_owner *owner;
+
+	if (!pi->extra || !pi->extra->evpn)
+		return;
+	owners = pi->extra->evpn->ip_ead_owners;
+	if (!owners)
+		return;
+
+	frr_each_safe (bgp_evpn_ip_ead_path_owner_list, &owners->list, owner)
+		if (!bgp_vrf || owner->bgp_vrf == bgp_vrf)
+			bgp_evpn_ip_ead_path_owner_del(owners, owner);
+}
+
+static void bgp_evpn_ip_ead_flush_vrf(struct bgp *bgp_vrf)
+{
+	struct bgp *bgp_evpn = bgp_get_evpn();
+	struct bgp_dest *rd_dest, *dest;
+	struct bgp_table *table;
+	struct bgp_path_info *pi;
+
+	if (!bgp_evpn)
+		return;
+
+	for (rd_dest = bgp_table_top(bgp_evpn->rib[AFI_L2VPN][SAFI_EVPN]); rd_dest;
+	     rd_dest = bgp_route_next(rd_dest)) {
+		table = bgp_dest_get_bgp_table_info(rd_dest);
+		if (!table)
+			continue;
+		for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest))
+			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+				bgp_evpn_ip_ead_path_owners_drain(pi, bgp_vrf);
+	}
+}
+
 void bgp_evpn_ip_ead_flush_all(void)
 {
 	struct bgp_evpn_es *es, *es_next;
@@ -4375,11 +4517,12 @@ void bgp_evpn_ip_ead_flush_all(void)
 	if (!bgp_mh_info)
 		return;
 
+	bgp_evpn_ip_ead_flush_vrf(NULL);
+
 	RB_FOREACH_SAFE (es, bgp_es_rb_head, &bgp_mh_info->es_rb_tree, es_next) {
 		for (ALL_LIST_ELEMENTS(es->es_vrf_list, node, next, es_vrf)) {
 			es_vrf->ip_ead_drop_label = 0;
 			es_vrf->ip_ead_drop_rmac = 0;
-			bgp_evpn_es_vrf_vtep_flush(es_vrf);
 		}
 		bgp_evpn_es_l3_vtep_re_eval_all(es);
 		for (ALL_LIST_ELEMENTS(es->es_vrf_list, node, next, es_vrf))
@@ -4966,9 +5109,8 @@ bgp_evpn_local_es_evi_do_del(struct bgp_evpn_es_evi *es_evi)
 static struct bgp_evpn_es_l3evi *bgp_evpn_es_l3evi_find(const esi_t *esi, vni_t l3vni)
 {
 	struct bgp_evpn_es_l3evi *l3evi;
-	struct listnode *node;
 
-	for (ALL_LIST_ELEMENTS_RO(bgp_mh_info->l3evi_list, node, l3evi))
+	frr_each (bgp_evpn_es_l3evi_list, &bgp_mh_info->l3evi_list, l3evi)
 		if (l3evi->l3vni == l3vni && !memcmp(&l3evi->esi, esi, sizeof(esi_t)))
 			return l3evi;
 
@@ -5049,7 +5191,7 @@ static void bgp_evpn_es_l3evi_unbind(struct bgp_evpn_es_l3evi *l3evi)
 static void bgp_evpn_es_l3evi_free(struct bgp_evpn_es_l3evi *l3evi)
 {
 	bgp_evpn_es_l3evi_unbind(l3evi);
-	list_delete_node(bgp_mh_info->l3evi_list, &l3evi->listnode);
+	bgp_evpn_es_l3evi_list_del(&bgp_mh_info->l3evi_list, l3evi);
 	XFREE(MTYPE_BGP_EVPN_ES_L3EVI, l3evi);
 }
 
@@ -5066,8 +5208,7 @@ static int bgp_evpn_local_es_l3evi_add(const esi_t *esi, vni_t l3vni)
 		l3evi = XCALLOC(MTYPE_BGP_EVPN_ES_L3EVI, sizeof(*l3evi));
 		memcpy(&l3evi->esi, esi, sizeof(esi_t));
 		l3evi->l3vni = l3vni;
-		listnode_init(&l3evi->listnode, l3evi);
-		listnode_add(bgp_mh_info->l3evi_list, &l3evi->listnode);
+		bgp_evpn_es_l3evi_list_add_tail(&bgp_mh_info->l3evi_list, l3evi);
 	}
 
 	bgp_evpn_es_l3evi_bind(l3evi);
@@ -5078,9 +5219,8 @@ static int bgp_evpn_local_es_l3evi_add(const esi_t *esi, vni_t l3vni)
 static void bgp_evpn_local_es_l3evi_del_all(struct bgp_evpn_es *es)
 {
 	struct bgp_evpn_es_l3evi *l3evi;
-	struct listnode *node, *next;
 
-	for (ALL_LIST_ELEMENTS(bgp_mh_info->l3evi_list, node, next, l3evi))
+	frr_each_safe (bgp_evpn_es_l3evi_list, &bgp_mh_info->l3evi_list, l3evi)
 		if (!memcmp(&l3evi->esi, &es->esi, sizeof(esi_t)))
 			bgp_evpn_es_l3evi_free(l3evi);
 }
@@ -5089,9 +5229,8 @@ static void bgp_evpn_local_es_l3evi_del_all(struct bgp_evpn_es *es)
 static void bgp_evpn_local_es_l3evi_bind_all(struct bgp_evpn_es *es)
 {
 	struct bgp_evpn_es_l3evi *l3evi;
-	struct listnode *node;
 
-	for (ALL_LIST_ELEMENTS_RO(bgp_mh_info->l3evi_list, node, l3evi))
+	frr_each (bgp_evpn_es_l3evi_list, &bgp_mh_info->l3evi_list, l3evi)
 		if (!memcmp(&l3evi->esi, &es->esi, sizeof(esi_t)))
 			bgp_evpn_es_l3evi_bind(l3evi);
 }
@@ -5102,12 +5241,11 @@ static void bgp_evpn_local_es_l3evi_bind_all(struct bgp_evpn_es *es)
 void bgp_evpn_es_l3evi_vrf_update(struct bgp *bgp_vrf, bool add)
 {
 	struct bgp_evpn_es_l3evi *l3evi;
-	struct listnode *node;
 
 	if (!bgp_mh_info)
 		return;
 
-	for (ALL_LIST_ELEMENTS_RO(bgp_mh_info->l3evi_list, node, l3evi)) {
+	frr_each (bgp_evpn_es_l3evi_list, &bgp_mh_info->l3evi_list, l3evi) {
 		if (add) {
 			if (bgp_vrf->l3vni && l3evi->l3vni == bgp_vrf->l3vni)
 				bgp_evpn_es_l3evi_bind(l3evi);
@@ -6439,8 +6577,7 @@ void bgp_evpn_mh_init(void)
 	bgp_mh_info->pend_es_list = list_new();
 	listset_app_node_mem(bgp_mh_info->pend_es_list);
 	/* L3VNI ES-EVIs */
-	bgp_mh_info->l3evi_list = list_new();
-	listset_app_node_mem(bgp_mh_info->l3evi_list);
+	bgp_evpn_es_l3evi_list_init(&bgp_mh_info->l3evi_list);
 
 	bgp_mh_info->enable_ead_evi_rx = BGP_EVPN_MH_EAD_EVI_RX_DEF;
 	bgp_mh_info->enable_ead_evi_tx = BGP_EVPN_MH_EAD_EVI_TX_DEF;
@@ -6509,13 +6646,13 @@ void bgp_evpn_mh_finish(void)
 	struct bgp_evpn_es *es;
 	struct bgp_evpn_es *es_next;
 	struct bgp_evpn_es_l3evi *l3evi;
-	struct listnode *l3_node, *l3_next;
 
 	if (BGP_DEBUG(evpn_mh, EVPN_MH_RT))
 		zlog_debug("evpn mh finish");
 
-	for (ALL_LIST_ELEMENTS(bgp_mh_info->l3evi_list, l3_node, l3_next, l3evi))
+	frr_each_safe (bgp_evpn_es_l3evi_list, &bgp_mh_info->l3evi_list, l3evi)
 		bgp_evpn_es_l3evi_free(l3evi);
+	bgp_evpn_es_l3evi_list_fini(&bgp_mh_info->l3evi_list);
 
 	/* Force cleanup of all ES structures including ES-EVI and ES-VRF.
 	 * During shutdown, normal cleanup may fail due to guard conditions
@@ -6568,7 +6705,6 @@ void bgp_evpn_mh_finish(void)
 	event_cancel(&bgp_mh_info->t_cons_check);
 	list_delete(&bgp_mh_info->local_es_list);
 	list_delete(&bgp_mh_info->pend_es_list);
-	list_delete(&bgp_mh_info->l3evi_list);
 	list_delete(&bgp_mh_info->ead_es_export_rtl);
 
 	XFREE(MTYPE_BGP_EVPN_MH_INFO, bgp_mh_info);
