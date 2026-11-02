@@ -39,7 +39,7 @@ DEFINE_MTYPE_STATIC(ZEBRA, ZEVPN_BPP_EVI, "EVPN-MH bridge-port protection ES-EVI
 DEFINE_MTYPE_STATIC(ZEBRA, ZEVPN_BPP_IF, "EVPN-MH bridge-port protection interface");
 DEFINE_MTYPE_STATIC(ZEBRA, ZEVPN_BPP_PEER, "EVPN-MH bridge-port protection peer");
 DEFINE_MTYPE_STATIC(ZEBRA, ZEVPN_BPP_NH, "EVPN-MH bridge-port protection member");
-DEFINE_MTYPE_STATIC(ZEBRA, ZEVPN_BPP_XLOG, "EVPN-MH bridge-port protection export");
+DEFINE_MTYPE_STATIC(ZEBRA, ZEVPN_BPP_EXPORT, "EVPN-MH bridge-port protection export");
 
 enum zebra_evpn_bpp_state {
 	ZEBRA_EVPN_BPP_DISABLED,
@@ -284,7 +284,7 @@ struct zebra_evpn_bpp_xtab_bind {
 	struct zebra_evpn_bpp_xtab_bind_hash_item item;
 };
 
-struct zebra_evpn_bpp_xlog {
+struct zebra_evpn_bpp_export_log {
 	uint32_t seq;
 	enum dplane_op_e op;
 	bool is_del;
@@ -350,11 +350,11 @@ static struct zebra_evpn_bpp_nh_id_hash_head bpp_nh_retire;
 static struct zebra_evpn_bpp_xtab_nh_hash_head bpp_xtab_nh;
 static struct zebra_evpn_bpp_xtab_nhg_hash_head bpp_xtab_nhg;
 static struct zebra_evpn_bpp_xtab_bind_hash_head bpp_xtab_bind;
-static struct zebra_evpn_bpp_xlog bpp_xlog[ZEBRA_EVPN_BPP_EXPORT_LOG_LEN];
-static uint32_t bpp_xlog_head;
-static uint32_t bpp_xlog_count;
-static uint32_t bpp_xlog_seq;
-static uint32_t bpp_xlog_overruns;
+static struct zebra_evpn_bpp_export_log bpp_export_log[ZEBRA_EVPN_BPP_EXPORT_LOG_LEN];
+static uint32_t bpp_export_log_head;
+static uint32_t bpp_export_log_count;
+static uint32_t bpp_export_log_seq;
+static uint32_t bpp_export_log_overruns;
 static uint32_t bpp_xcnt_member_add;
 static uint32_t bpp_xcnt_member_del;
 static uint32_t bpp_xcnt_group_add;
@@ -787,39 +787,40 @@ static const char *zebra_evpn_bpp_xstatus_str(enum zebra_evpn_bpp_xstatus st)
 	return "none";
 }
 
-static struct zebra_evpn_bpp_xlog *zebra_evpn_bpp_xlog_push(enum dplane_op_e op, bool is_del,
-							    uint32_t id)
+static struct zebra_evpn_bpp_export_log *zebra_evpn_bpp_export_log_push(enum dplane_op_e op,
+									bool is_del, uint32_t id)
 {
-	struct zebra_evpn_bpp_xlog *ent;
+	struct zebra_evpn_bpp_export_log *ent;
 
-	if (bpp_xlog_count == ZEBRA_EVPN_BPP_EXPORT_LOG_LEN) {
-		bpp_xlog_overruns++;
-		bpp_xlog_count--;
+	if (bpp_export_log_count == ZEBRA_EVPN_BPP_EXPORT_LOG_LEN) {
+		bpp_export_log_overruns++;
+		bpp_export_log_count--;
 	}
-	ent = &bpp_xlog[bpp_xlog_head];
+	ent = &bpp_export_log[bpp_export_log_head];
 	memset(ent, 0, sizeof(*ent));
-	ent->seq = ++bpp_xlog_seq;
+	ent->seq = ++bpp_export_log_seq;
 	ent->op = op;
 	ent->is_del = is_del;
 	ent->id = id;
 	ent->time = monotime(NULL);
-	bpp_xlog_head = (bpp_xlog_head + 1) % ZEBRA_EVPN_BPP_EXPORT_LOG_LEN;
-	if (bpp_xlog_count < ZEBRA_EVPN_BPP_EXPORT_LOG_LEN)
-		bpp_xlog_count++;
+	bpp_export_log_head = (bpp_export_log_head + 1) % ZEBRA_EVPN_BPP_EXPORT_LOG_LEN;
+	if (bpp_export_log_count < ZEBRA_EVPN_BPP_EXPORT_LOG_LEN)
+		bpp_export_log_count++;
 	return ent;
 }
 
-static struct zebra_evpn_bpp_xlog *zebra_evpn_bpp_xlog_find(enum dplane_op_e op, uint32_t id,
-							    const char *ifname)
+static struct zebra_evpn_bpp_export_log *
+zebra_evpn_bpp_export_log_find(enum dplane_op_e op, uint32_t id, const char *ifname)
 {
 	uint32_t i, idx, n;
 
-	if (!bpp_xlog_count)
+	if (!bpp_export_log_count)
 		return NULL;
-	n = bpp_xlog_count;
-	idx = (bpp_xlog_head + ZEBRA_EVPN_BPP_EXPORT_LOG_LEN - 1) % ZEBRA_EVPN_BPP_EXPORT_LOG_LEN;
+	n = bpp_export_log_count;
+	idx = (bpp_export_log_head + ZEBRA_EVPN_BPP_EXPORT_LOG_LEN - 1) %
+	      ZEBRA_EVPN_BPP_EXPORT_LOG_LEN;
 	for (i = 0; i < n; i++) {
-		struct zebra_evpn_bpp_xlog *ent = &bpp_xlog[idx];
+		struct zebra_evpn_bpp_export_log *ent = &bpp_export_log[idx];
 
 		if (!ent->completed && ent->op == op) {
 			if (op == DPLANE_OP_BR_PORT_UPDATE) {
@@ -841,7 +842,7 @@ static void zebra_evpn_bpp_xtab_nh_upsert(const struct zebra_evpn_bpp_nh *nh)
 
 	e = zebra_evpn_bpp_xtab_nh_hash_find(&bpp_xtab_nh, &key);
 	if (!e) {
-		e = XCALLOC(MTYPE_ZEVPN_BPP_XLOG, sizeof(*e));
+		e = XCALLOC(MTYPE_ZEVPN_BPP_EXPORT, sizeof(*e));
 		e->nh_id = nh->nh_id;
 		zebra_evpn_bpp_xtab_nh_hash_add(&bpp_xtab_nh, e);
 	}
@@ -859,7 +860,7 @@ static void zebra_evpn_bpp_xtab_nh_del(uint32_t nh_id)
 	if (!e)
 		return;
 	zebra_evpn_bpp_xtab_nh_hash_del(&bpp_xtab_nh, e);
-	XFREE(MTYPE_ZEVPN_BPP_XLOG, e);
+	XFREE(MTYPE_ZEVPN_BPP_EXPORT, e);
 }
 
 static int zebra_evpn_bpp_peer_ptr_cmp(const void *a, const void *b)
@@ -909,7 +910,7 @@ static void zebra_evpn_bpp_xtab_nhg_upsert(uint32_t nhg_id, const esi_t *esi, ui
 
 	e = zebra_evpn_bpp_xtab_nhg_hash_find(&bpp_xtab_nhg, &key);
 	if (!e) {
-		e = XCALLOC(MTYPE_ZEVPN_BPP_XLOG, sizeof(*e));
+		e = XCALLOC(MTYPE_ZEVPN_BPP_EXPORT, sizeof(*e));
 		e->nhg_id = nhg_id;
 		zebra_evpn_bpp_xtab_nhg_hash_add(&bpp_xtab_nhg, e);
 	}
@@ -931,15 +932,15 @@ static void zebra_evpn_bpp_xtab_nhg_del(uint32_t nhg_id)
 	if (!e)
 		return;
 	zebra_evpn_bpp_xtab_nhg_hash_del(&bpp_xtab_nhg, e);
-	XFREE(MTYPE_ZEVPN_BPP_XLOG, e);
+	XFREE(MTYPE_ZEVPN_BPP_EXPORT, e);
 }
 
 static void zebra_evpn_bpp_member_enqueue(struct zebra_evpn_bpp_nh *nh, bool is_del)
 {
-	struct zebra_evpn_bpp_xlog *ent;
+	struct zebra_evpn_bpp_export_log *ent;
 
 	dplane_evpn_mh_nh_update(is_del, nh->nh_id, nh->type, &nh->vtep, &nh->rmac);
-	ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_EVPN_MH_NH_UPDATE, is_del, nh->nh_id);
+	ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_EVPN_MH_NH_UPDATE, is_del, nh->nh_id);
 	ent->type = nh->type;
 	ent->vtep = nh->vtep;
 	ent->rmac = nh->rmac;
@@ -960,8 +961,8 @@ static void zebra_evpn_bpp_member_enqueue(struct zebra_evpn_bpp_nh *nh, bool is_
 static void zebra_evpn_bpp_group_enqueue(struct zebra_evpn_es *es, struct zebra_evpn_bpp_if *bif,
 					 bool is_del)
 {
-	struct dplane_evpn_mh_member members[ES_VTEP_MAX_CNT];
-	struct zebra_evpn_bpp_xlog *ent;
+	struct dplane_evpn_mh_member members[ES_VTEP_MAX_CNT] = {};
+	struct zebra_evpn_bpp_export_log *ent;
 	uint32_t count = 0, i;
 
 	if (!es || !es->l3_nhg_id)
@@ -981,7 +982,7 @@ static void zebra_evpn_bpp_group_enqueue(struct zebra_evpn_es *es, struct zebra_
 	}
 
 	dplane_evpn_mh_nhg_update(is_del, es->l3_nhg_id, &es->esi, count, count ? members : NULL);
-	ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_EVPN_MH_NHG_UPDATE, is_del, es->l3_nhg_id);
+	ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_EVPN_MH_NHG_UPDATE, is_del, es->l3_nhg_id);
 	memcpy(&ent->esi, &es->esi, sizeof(esi_t));
 	ent->member_count = count;
 	for (i = 0; i < count && i < ZEBRA_EVPN_BPP_EXPORT_LOG_MEMBERS; i++)
@@ -1810,7 +1811,7 @@ bool zebra_evpn_bpp_es_bound(const struct zebra_evpn_es *es)
 
 void zebra_evpn_bpp_export_br_port(struct zebra_evpn_es *es, bool is_del)
 {
-	struct zebra_evpn_bpp_xlog *ent;
+	struct zebra_evpn_bpp_export_log *ent;
 	struct zebra_evpn_bpp_xtab_bind key, *e;
 	struct zebra_evpn_bpp_if *bif;
 	uint32_t backup;
@@ -1819,7 +1820,7 @@ void zebra_evpn_bpp_export_br_port(struct zebra_evpn_es *es, bool is_del)
 		return;
 
 	backup = is_del ? 0 : es->l3_nhg_id;
-	ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_BR_PORT_UPDATE, is_del, backup);
+	ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_BR_PORT_UPDATE, is_del, backup);
 	strlcpy(ent->ifname, es->zif->ifp->name, sizeof(ent->ifname));
 	memcpy(&ent->esi, &es->esi, sizeof(esi_t));
 
@@ -1829,14 +1830,14 @@ void zebra_evpn_bpp_export_br_port(struct zebra_evpn_es *es, bool is_del)
 		bpp_xcnt_bind_del++;
 		if (e) {
 			zebra_evpn_bpp_xtab_bind_hash_del(&bpp_xtab_bind, e);
-			XFREE(MTYPE_ZEVPN_BPP_XLOG, e);
+			XFREE(MTYPE_ZEVPN_BPP_EXPORT, e);
 		}
 		return;
 	}
 
 	bpp_xcnt_bind_add++;
 	if (!e) {
-		e = XCALLOC(MTYPE_ZEVPN_BPP_XLOG, sizeof(*e));
+		e = XCALLOC(MTYPE_ZEVPN_BPP_EXPORT, sizeof(*e));
 		e->ifindex = es->zif->ifp->ifindex;
 		zebra_evpn_bpp_xtab_bind_hash_add(&bpp_xtab_bind, e);
 	}
@@ -1853,7 +1854,7 @@ void zebra_evpn_bpp_export_br_port(struct zebra_evpn_es *es, bool is_del)
 void zebra_evpn_bpp_dplane_result(struct zebra_dplane_ctx *ctx)
 {
 	enum dplane_op_e op;
-	struct zebra_evpn_bpp_xlog *ent;
+	struct zebra_evpn_bpp_export_log *ent;
 	struct zebra_evpn_bpp_nh key, *nh;
 	const char *ifname;
 	uint32_t id = 0;
@@ -1872,7 +1873,7 @@ void zebra_evpn_bpp_dplane_result(struct zebra_dplane_ctx *ctx)
 	else if (op != DPLANE_OP_EVPN_MH_REPLAY_DONE)
 		return;
 
-	ent = zebra_evpn_bpp_xlog_find(op, id, ifname);
+	ent = zebra_evpn_bpp_export_log_find(op, id, ifname);
 	if (ent) {
 		ent->completed = true;
 		ent->result = dplane_ctx_get_status(ctx);
@@ -1907,7 +1908,7 @@ void zebra_evpn_bpp_replay(void)
 	struct zebra_evpn_bpp_xtab_nh *nh;
 	struct zebra_evpn_bpp_xtab_nhg *nhg;
 	struct zebra_evpn_bpp_xtab_bind *bind;
-	struct zebra_evpn_bpp_xlog *ent;
+	struct zebra_evpn_bpp_export_log *ent;
 	struct zebra_evpn_es *es;
 	struct ipaddr sph_filters[ES_VTEP_MAX_CNT];
 	uint32_t i;
@@ -1918,7 +1919,7 @@ void zebra_evpn_bpp_replay(void)
 	memset(sph_filters, 0, sizeof(sph_filters));
 	frr_each (zebra_evpn_bpp_xtab_nh_hash, &bpp_xtab_nh, nh) {
 		dplane_evpn_mh_nh_update(false, nh->nh_id, nh->type, &nh->vtep, &nh->rmac);
-		ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_EVPN_MH_NH_UPDATE, false, nh->nh_id);
+		ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_EVPN_MH_NH_UPDATE, false, nh->nh_id);
 		ent->replay = true;
 		ent->type = nh->type;
 		ent->vtep = nh->vtep;
@@ -1927,7 +1928,8 @@ void zebra_evpn_bpp_replay(void)
 	frr_each (zebra_evpn_bpp_xtab_nhg_hash, &bpp_xtab_nhg, nhg) {
 		dplane_evpn_mh_nhg_update(false, nhg->nhg_id, &nhg->esi, nhg->member_count,
 					  nhg->members);
-		ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_EVPN_MH_NHG_UPDATE, false, nhg->nhg_id);
+		ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_EVPN_MH_NHG_UPDATE, false,
+						     nhg->nhg_id);
 		ent->replay = true;
 		memcpy(&ent->esi, &nhg->esi, sizeof(esi_t));
 		ent->member_count = nhg->member_count;
@@ -1939,14 +1941,14 @@ void zebra_evpn_bpp_replay(void)
 		if (!es || !es->zif || !es->zif->ifp)
 			continue;
 		dplane_br_port_update(es->zif->ifp, false, 0, sph_filters, bind->backup_nhg_id);
-		ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_BR_PORT_UPDATE, false,
-					       bind->backup_nhg_id);
+		ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_BR_PORT_UPDATE, false,
+						     bind->backup_nhg_id);
 		ent->replay = true;
 		strlcpy(ent->ifname, bind->ifname, sizeof(ent->ifname));
 		memcpy(&ent->esi, &bind->esi, sizeof(esi_t));
 	}
 	dplane_evpn_mh_replay_done();
-	ent = zebra_evpn_bpp_xlog_push(DPLANE_OP_EVPN_MH_REPLAY_DONE, false, 0);
+	ent = zebra_evpn_bpp_export_log_push(DPLANE_OP_EVPN_MH_REPLAY_DONE, false, 0);
 	ent->replay = true;
 }
 
@@ -2033,10 +2035,11 @@ void zebra_evpn_bpp_show_export(struct vty *vty, bool uj)
 	json_object_object_add(jt, "bindings", jb);
 	json_object_object_add(json, "tables", jt);
 
-	n = bpp_xlog_count;
-	idx = (bpp_xlog_head + ZEBRA_EVPN_BPP_EXPORT_LOG_LEN - n) % ZEBRA_EVPN_BPP_EXPORT_LOG_LEN;
+	n = bpp_export_log_count;
+	idx = (bpp_export_log_head + ZEBRA_EVPN_BPP_EXPORT_LOG_LEN - n) %
+	      ZEBRA_EVPN_BPP_EXPORT_LOG_LEN;
 	for (i = 0; i < n; i++) {
-		struct zebra_evpn_bpp_xlog *ent = &bpp_xlog[idx];
+		struct zebra_evpn_bpp_export_log *ent = &bpp_export_log[idx];
 		json_object *ids;
 		uint32_t mi;
 
@@ -2077,7 +2080,7 @@ void zebra_evpn_bpp_show_export(struct vty *vty, bool uj)
 	json_object_int_add(je, "groupDel", bpp_xcnt_group_del);
 	json_object_int_add(je, "bindingAdd", bpp_xcnt_bind_add);
 	json_object_int_add(je, "bindingDel", bpp_xcnt_bind_del);
-	json_object_int_add(je, "logOverruns", bpp_xlog_overruns);
+	json_object_int_add(je, "exportLogOverruns", bpp_export_log_overruns);
 	json_object_int_add(je, "membersLive", zebra_evpn_bpp_nh_hash_count(&bpp_nh_hash));
 	json_object_int_add(je, "pendingDeletes", zebra_evpn_bpp_nh_id_hash_count(&bpp_nh_retire));
 	json_object_object_add(json, "counters", je);
@@ -2126,11 +2129,11 @@ void zebra_evpn_bpp_terminate(void)
 		XFREE(MTYPE_ZEVPN_BPP_NH, nh);
 	}
 	while ((xnh = zebra_evpn_bpp_xtab_nh_hash_pop(&bpp_xtab_nh)))
-		XFREE(MTYPE_ZEVPN_BPP_XLOG, xnh);
+		XFREE(MTYPE_ZEVPN_BPP_EXPORT, xnh);
 	while ((xnhg = zebra_evpn_bpp_xtab_nhg_hash_pop(&bpp_xtab_nhg)))
-		XFREE(MTYPE_ZEVPN_BPP_XLOG, xnhg);
+		XFREE(MTYPE_ZEVPN_BPP_EXPORT, xnhg);
 	while ((xbind = zebra_evpn_bpp_xtab_bind_hash_pop(&bpp_xtab_bind)))
-		XFREE(MTYPE_ZEVPN_BPP_XLOG, xbind);
+		XFREE(MTYPE_ZEVPN_BPP_EXPORT, xbind);
 	zebra_evpn_bpp_if_hash_fini(&bpp_if_hash);
 	zebra_evpn_bpp_nh_hash_fini(&bpp_nh_hash);
 	zebra_evpn_bpp_nh_id_hash_fini(&bpp_nh_retire);
