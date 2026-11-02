@@ -470,8 +470,10 @@ extern void zebra_evpn_es_show_detail(struct vty *vty, bool uj);
 extern void zebra_evpn_es_show_esi(struct vty *vty, bool uj, esi_t *esi);
 extern void zebra_evpn_mh_vtep_show(struct vty *vty, bool uj);
 extern void zebra_evpn_update_all_es(struct zebra_evpn *zevpn);
-extern void zebra_evpn_proc_remote_es(ZAPI_HANDLER_ARGS);
-extern void zebra_evpn_proc_bpp_peer(ZAPI_HANDLER_ARGS);
+extern void zebra_evpn_proc_remote_es(struct zserv *client, struct zmsghdr *hdr,
+				      struct stream *msg, struct zebra_vrf *zvrf);
+extern void zebra_evpn_proc_bpp_peer(struct zserv *client, struct zmsghdr *hdr, struct stream *msg,
+				     struct zebra_vrf *zvrf);
 int zebra_evpn_remote_es_add(const esi_t *esi, struct ipaddr *vtep_ip, bool esr_rxed,
 			     uint8_t df_alg, uint16_t df_pref);
 int zebra_evpn_remote_es_del(const esi_t *esi, struct ipaddr *vtep_ip);
@@ -527,7 +529,8 @@ zebra_evpn_access_bd_bridge_cleanup(vlanid_t vid, struct interface *br_if,
 				    struct zebra_evpn_access_bd *acc_bd);
 extern void zebra_evpn_es_bypass_update(struct zebra_evpn_es *es,
 					struct interface *ifp, bool bypass);
-extern void zebra_evpn_proc_remote_nh(ZAPI_HANDLER_ARGS);
+extern void zebra_evpn_proc_remote_nh(struct zserv *client, struct zmsghdr *hdr,
+				      struct stream *msg, struct zebra_vrf *zvrf);
 extern struct zebra_evpn_es_evi *
 zebra_evpn_es_evi_find(struct zebra_evpn_es *es, struct zebra_evpn *zevpn);
 extern int zebra_evpn_vl_vxl_bridge_lookup(uint16_t vid,
