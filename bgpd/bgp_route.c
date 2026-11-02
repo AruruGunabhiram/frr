@@ -6816,10 +6816,13 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			}
 		}
 
-		/* The labels select the MAC/IP route's import (L2VNI or pure-L3
-		 * L3VNI): unimport under the old ones, re-import under the new.
+		/* Labels select the MAC/IP route's import (L2VNI or pure-L3
+		 * L3VNI) and the A-D per-EVI's L3VNI. Unimport under the old
+		 * labels and re-import under the new ones.
 		 */
-		if (safi == SAFI_EVPN && p->u.prefix_evpn.route_type == BGP_EVPN_MAC_IP_ROUTE &&
+		if (safi == SAFI_EVPN &&
+		    (p->u.prefix_evpn.route_type == BGP_EVPN_MAC_IP_ROUTE ||
+		     p->u.prefix_evpn.route_type == BGP_EVPN_AD_ROUTE) &&
 		    bgp_labels.num_labels &&
 		    !bgp_path_info_labels_same(pi, &bgp_labels.label[0], bgp_labels.num_labels)) {
 			if (!evpn_unimported)
