@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 290" width="920" height="290" role="img" aria-labelledby="title desc">
+<title id="title">Two ways a robot loses its controller route</title>
+<desc id="desc">Left: the new leaf rejects early ARPs until the old binding is withdrawn. Right: two leaves claim the same sequence and the lower VTEP IP wins.</desc>
+<style>text{font-family:Arial,sans-serif;fill:#193441}.heading{font-size:21px;font-weight:bold}.step{font-size:17px}.outcome{font-size:17px;font-weight:bold}</style>
+<g transform="translate(2,2)">
+<rect width="451" height="283" rx="7" fill="#f7fafb" stroke="#ccd9dd"/>
+<rect x="0" y="0" width="451" height="5" fill="#12695e"/>
+<text x="16" y="37" class="heading">A. IP relearn and the NOARP race</text>
+<path d="M 23 75 V 94 m -4 -5 l 4 5 4 -5" fill="none" stroke="#12695e" stroke-width="1.6"/>
+<circle cx="23" cy="65" r="4" fill="#12695e"/>
+<text x="37" y="70" class="step">Robot attaches to the new leaf.</text>
+<path d="M 23 121 V 160 m -4 -5 l 4 5 4 -5" fill="none" stroke="#12695e" stroke-width="1.6"/>
+<circle cx="23" cy="111" r="4" fill="#12695e"/>
+<text x="37" y="116" class="step">The remote NOARP neighbor still exists.</text>
+<text x="37" y="137" class="step">Linux rejects the early ARPs (-EPERM).</text>
+<path d="M 23 188 V 239 m -4 -5 l 4 5 4 -5" fill="none" stroke="#12695e" stroke-width="1.6"/>
+<circle cx="23" cy="178" r="4" fill="#12695e"/>
+<text x="37" y="183" class="step">Load or MRAI delays the old leaf’s withdrawal.</text>
+<text x="37" y="204" class="step">It clears the remote entry after the burst ends.</text>
+<rect x="10" y="239" width="431" height="34" rx="4" fill="#e2edee"/>
+<circle cx="23" cy="257" r="4" fill="#12695e"/>
+<text x="37" y="262" class="outcome">The robot stays silent. Leaf5 lacks its /32.</text>
+</g>
+<g transform="translate(466,2)">
+<rect width="451" height="283" rx="7" fill="#f7fafb" stroke="#ccd9dd"/>
+<rect x="0" y="0" width="451" height="5" fill="#305987"/>
+<text x="16" y="37" class="heading">B. Equal MAC mobility sequences</text>
+<path d="M 23 75 V 94 m -4 -5 l 4 5 4 -5" fill="none" stroke="#305987" stroke-width="1.6"/>
+<circle cx="23" cy="65" r="4" fill="#305987"/>
+<text x="37" y="70" class="step">Robot moves from leaf A to B, then to C.</text>
+<path d="M 23 121 V 160 m -4 -5 l 4 5 4 -5" fill="none" stroke="#305987" stroke-width="1.6"/>
+<circle cx="23" cy="111" r="4" fill="#305987"/>
+<text x="37" y="116" class="step">C learns the robot before B’s update arrives.</text>
+<text x="37" y="137" class="step">B and C advertise the same sequence.</text>
+<path d="M 23 188 V 239 m -4 -5 l 4 5 4 -5" fill="none" stroke="#305987" stroke-width="1.6"/>
+<circle cx="23" cy="178" r="4" fill="#305987"/>
+<text x="37" y="183" class="step">EVPN picks the lower VTEP IP.</text>
+<text x="37" y="204" class="step">In this case, B wins the tie.</text>
+<rect x="10" y="239" width="431" height="34" rx="4" fill="#e2edee"/>
+<circle cx="23" cy="257" r="4" fill="#305987"/>
+<text x="37" y="262" class="outcome">Traffic goes to B. The robot is at C.</text>
+</g>
+</svg>
